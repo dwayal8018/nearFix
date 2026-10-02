@@ -1,0 +1,430 @@
+// NearFix database schema
+// PostgreSQL (local in dev, Supabase in prod — both Postgres, so this is portable).
+// Money is stored as integer PAISE (₹1 = 100 paise) to avoid floating-point errors.
+// Geo is stored as latitude/longitude floats; distance is computed with Haversine
+// in the service layer (no PostGIS needed for v1).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  CUSTOMER
+  PROVIDER
+  ADMIN
+}
+
+enum AccountStatus {
+  ACTIVE
+  PENDING
+  SUSPENDED
+  BANNED
+}
+
+enum VerificationStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum ChargeModel {
+  PER_TASK
+  PER_HOUR
+  BOTH
+}
+
+enum RequestStatus {
+  OPEN
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum InviteStatus {
+  INVITED
+  ACCEPTED
+  DECLINED
+}
+
+enum ReportStatus {
+  OPEN
+  DISMISSED
+  ACTIONED
+}
+
+enum ModerationActionType {
+  WARN
+  SUSPEND
+  BAN
+  DISMISS
+}
+
+// ---------------------------------------------------------------------------
+// Core user
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String        @id @default(cuid())
+  name         String
+  phone        String        @unique // +91 10-digit, validated in app layer
+  passwordHash String
+  role         Role
+  status       AccountStatus @default(ACTIVE)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  // Relations
+  providerProfile ProviderProfile?
+  customerRequests ServiceRequest[] @relation("CustomerRequests")
+  invitesReceived  Invite[]         @relation("ProviderInvites")
+
+  chatThreadsAsCustomer ChatThread[] @relation("CustomerThreads")
+  chatThreadsAsProvider ChatThread[] @relation("ProviderThreads")
+  messagesSent          ChatMessage[]
+
+  reviewsWritten  Review[] @relation("CustomerReviews")
+  reviewsReceived Review[] @relation("ProviderReviews")
+
+  reportsFiled    Report[] @relation("Reporter")
+  reportsAgainst  Report[] @relation("Reported")
+
+  moderationActionsReceived ModerationAction[] @relation("ModerationTarget")
+  moderationActionsTaken    ModerationAction[] @relation("ModerationAdmin")
+
+  verifiedProfiles ProviderProfile[] @relation("VerifiedByAdmin")
+
+  locationShares   LiveLocationShare[]
+
+  providerSubscriptions ProviderSubscription[]
+
+  @@index([role])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Provider profile
+// ---------------------------------------------------------------------------
+
+model ProviderProfile {
+  id              String             @id @default(cuid())
+  userId          String             @unique
+  user            User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  bio             String             @default("")
+  yearsExperience Int                @default(0)
+
+  baseLatitude    Float?
+  baseLongitude   Float?
+  baseAddress     String             @default("")
+  serviceRadiusKm Int                @default(5)
+
+  chargeModel     ChargeModel        @default(PER_TASK)
+  perTaskPaise    Int?
+  perHourPaise    Int?
+
+  verificationStatus VerificationStatus @default(PENDING)
+  verificationReason String?
+  verifiedByAdminId  String?
+  verifiedByAdmin    User?              @relation("VerifiedByAdmin", fields: [verifiedByAdminId], references: [id])
+  verifiedAt         DateTime?
+
+  // Monetization hook (unused in v1)
+  isFeatured      Boolean            @default(false)
+
+  // Denormalized rating cache (updated when reviews change)
+  avgRating       Float              @default(0)
+  reviewCount     Int                @default(0)
+
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  categories      ProviderCategory[]
+  photos          ProviderPhoto[]
+
+  @@index([verificationStatus])
+  @@index([isFeatured])
+}
+
+// ---------------------------------------------------------------------------
+// Service categories (seeded)
+// ---------------------------------------------------------------------------
+
+model ServiceCategory {
+  id        String             @id @default(cuid())
+  key       String             @unique // e.g. "plumbing"
+  label     String // e.g. "Plumbing"
+  active    Boolean            @default(true)
+  createdAt DateTime           @default(now())
+
+  providers ProviderCategory[]
+  requests  ServiceRequest[]
+}
+
+model ProviderCategory {
+  providerProfileId String
+  serviceCategoryId String
+
+  providerProfile ProviderProfile @relation(fields: [providerProfileId], references: [id], onDelete: Cascade)
+  serviceCategory ServiceCategory @relation(fields: [serviceCategoryId], references: [id], onDelete: Cascade)
+
+  @@id([providerProfileId, serviceCategoryId])
+  @@index([serviceCategoryId])
+}
+
+model ProviderPhoto {
+  id                String          @id @default(cuid())
+  providerProfileId String
+  providerProfile   ProviderProfile @relation(fields: [providerProfileId], references: [id], onDelete: Cascade)
+  url               String
+  isProfilePhoto    Boolean         @default(false)
+  createdAt         DateTime        @default(now())
+
+  @@index([providerProfileId])
+}
+
+// ---------------------------------------------------------------------------
+// Service requests
+// ---------------------------------------------------------------------------
+
+model ServiceRequest {
+  id          String        @id @default(cuid())
+  customerId  String
+  customer    User          @relation("CustomerRequests", fields: [customerId], references: [id], onDelete: Cascade)
+
+  categoryId  String
+  category    ServiceCategory @relation(fields: [categoryId], references: [id])
+
+  description String
+  budgetPaise Int
+
+  latitude    Float?
+  longitude   Float?
+  address     String        @default("")
+
+  status      RequestStatus @default(OPEN)
+  startedAt   DateTime?
+  completedAt DateTime?
+  cancelledAt DateTime?
+  cancelReason String?
+
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  invites     Invite[]
+  chatThread  ChatThread?
+  review      Review?
+  locationShares LiveLocationShare[]
+
+  // Reserved for future in-app payments / Razorpay escrow (unused in v1)
+  paymentRecord PaymentRecord?
+
+  @@index([customerId])
+  @@index([categoryId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Invites (customer -> provider), no direct contact exposed
+// ---------------------------------------------------------------------------
+
+model Invite {
+  id         String       @id @default(cuid())
+  requestId  String
+  request    ServiceRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  providerId String
+  provider   User         @relation("ProviderInvites", fields: [providerId], references: [id], onDelete: Cascade)
+
+  status     InviteStatus @default(INVITED)
+  respondedAt DateTime?
+
+  // Monetization hook (unused in v1)
+  leadFeePaise Int?
+
+  createdAt  DateTime     @default(now())
+
+  @@unique([requestId, providerId])
+  @@index([providerId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// In-app chat
+// ---------------------------------------------------------------------------
+
+model ChatThread {
+  id         String       @id @default(cuid())
+  requestId  String       @unique
+  request    ServiceRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  customerId String
+  customer   User         @relation("CustomerThreads", fields: [customerId], references: [id])
+  providerId String
+  provider   User         @relation("ProviderThreads", fields: [providerId], references: [id])
+
+  createdAt  DateTime     @default(now())
+  messages   ChatMessage[]
+
+  @@index([customerId])
+  @@index([providerId])
+}
+
+model ChatMessage {
+  id        String     @id @default(cuid())
+  threadId  String
+  thread    ChatThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  senderId  String
+  sender    User       @relation(fields: [senderId], references: [id])
+
+  body      String // contact details masked on write
+  createdAt DateTime   @default(now())
+  readAt    DateTime?
+
+  @@index([threadId])
+}
+
+// ---------------------------------------------------------------------------
+// Reviews (one per completed request, by that request's customer only)
+// ---------------------------------------------------------------------------
+
+model Review {
+  id         String       @id @default(cuid())
+  requestId  String       @unique
+  request    ServiceRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  providerId String
+  provider   User         @relation("ProviderReviews", fields: [providerId], references: [id])
+  customerId String
+  customer   User         @relation("CustomerReviews", fields: [customerId], references: [id])
+
+  rating     Int // 1..5 (validated in app layer)
+  text       String?
+  createdAt  DateTime     @default(now())
+
+  @@index([providerId])
+}
+
+// ---------------------------------------------------------------------------
+// Reports and moderation
+// ---------------------------------------------------------------------------
+
+model Report {
+  id             String       @id @default(cuid())
+  reporterId     String
+  reporter       User         @relation("Reporter", fields: [reporterId], references: [id])
+  reportedUserId String
+  reportedUser   User         @relation("Reported", fields: [reportedUserId], references: [id])
+
+  requestId      String?
+  category       String
+  description    String
+  status         ReportStatus @default(OPEN)
+  createdAt      DateTime     @default(now())
+
+  moderationAction ModerationAction?
+
+  @@index([reportedUserId])
+  @@index([status])
+}
+
+model ModerationAction {
+  id            String               @id @default(cuid())
+  adminId       String
+  admin         User                 @relation("ModerationAdmin", fields: [adminId], references: [id])
+  targetUserId  String
+  targetUser    User                 @relation("ModerationTarget", fields: [targetUserId], references: [id])
+
+  reportId      String?              @unique
+  report        Report?              @relation(fields: [reportId], references: [id])
+
+  action        ModerationActionType
+  reason        String?
+  createdAt     DateTime             @default(now())
+
+  @@index([targetUserId])
+}
+
+// ---------------------------------------------------------------------------
+// Live location sharing (only while a request is IN_PROGRESS)
+// ---------------------------------------------------------------------------
+
+model LiveLocationShare {
+  id        String   @id @default(cuid())
+  requestId String
+  request   ServiceRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+
+  latitude  Float
+  longitude Float
+  active    Boolean  @default(true)
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  @@unique([requestId, userId])
+  @@index([requestId])
+}
+
+// ---------------------------------------------------------------------------
+// App settings (feature flags, e.g. monetization_enabled)
+// ---------------------------------------------------------------------------
+
+model AppSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Monetization structures (reserved — created but unused in v1)
+// ---------------------------------------------------------------------------
+
+model SubscriptionPlan {
+  id            String   @id @default(cuid())
+  key           String   @unique
+  label         String
+  pricePaise    Int
+  periodDays    Int
+  active        Boolean  @default(false)
+  createdAt     DateTime @default(now())
+
+  subscriptions ProviderSubscription[]
+}
+
+model ProviderSubscription {
+  id         String   @id @default(cuid())
+  providerId String
+  provider   User     @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  planId     String
+  plan       SubscriptionPlan @relation(fields: [planId], references: [id])
+
+  startedAt  DateTime @default(now())
+  expiresAt  DateTime?
+  active     Boolean  @default(false)
+
+  @@index([providerId])
+}
+
+// Reserved for future in-app payments / escrow (unused in v1)
+model PaymentRecord {
+  id         String   @id @default(cuid())
+  requestId  String   @unique
+  request    ServiceRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  amountPaise Int
+  provider    String   @default("razorpay") // payment provider key
+  externalId  String?
+  status      String   @default("pending")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
